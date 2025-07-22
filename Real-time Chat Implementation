@@ -1,0 +1,213 @@
+// ChatMessage.java
+@Entity
+@Table(name = "chat_messages")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class ChatMessage {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "project_id")
+    private Project project;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "sender_id")
+    private User sender;
+    
+    @Column(columnDefinition = "TEXT", nullable = false)
+    private String content;
+    
+    @Enumerated(EnumType.STRING)
+    private MessageType type = MessageType.TEXT;
+    
+    // For file attachments
+    private String fileUrl;
+    private String fileName;
+    
+    // For task mentions
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "mentioned_task_id")
+    private Task mentionedTask;
+    
+    // For user mentions
+    @ManyToMany(fetch = FetchType.LAZY)
+    @JoinTable(
+        name = "message_mentions",
+        joinColumns = @JoinColumn(name = "message_id"),
+        inverseJoinColumns = @JoinColumn(name = "user_id")
+    )
+    private Set<User> mentionedUsers = new HashSet<>();
+    
+    @CreationTimestamp
+    private LocalDateTime createdAt;
+    
+    private Boolean edited = false;
+    private LocalDateTime editedAt;
+}
+
+// MessageType.java
+public enum MessageType {
+    TEXT, FILE, TASK_UPDATE, USER_JOINED, USER_LEFT, SYSTEM
+}
+
+// WebSocket Configuration
+@Configuration
+@EnableWebSocket
+@Slf4j
+public class WebSocketConfig implements WebSocketConfigurer {
+    
+    @Autowired
+    private ChatWebSocketHandler chatHandler;
+    
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(chatHandler, "/ws/chat/{projectId}")
+                .setAllowedOrigins("*")
+                .addInterceptors(new HttpSessionHandshakeInterceptor());
+    }
+}
+
+// ChatWebSocketHandler.java
+@Component
+@Slf4j
+public class ChatWebSocketHandler extends TextWebSocketHandler {
+    
+    @Autowired
+    private ChatService chatService;
+    
+    @Autowired
+    private ObjectMapper objectMapper;
+    
+    // Store active connections
+    private final Map<String, Set<WebSocketSession>> projectSessions = new ConcurrentHashMap<>();
+    private final Map<String, Long> sessionUserMap = new ConcurrentHashMap<>();
+    
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        String projectId = extractProjectId(session);
+        Long userId = extractUserId(session);
+        
+        log.info("WebSocket connection established: projectId={}, userId={}", projectId, userId);
+        
+        // Add session to project room
+        projectSessions.computeIfAbsent(projectId, k -> ConcurrentHashMap.newKeySet()).add(session);
+        sessionUserMap.put(session.getId(), userId);
+        
+        // Send user joined notification
+        ChatMessageDto joinMessage = ChatMessageDto.builder()
+            .type(MessageType.USER_JOINED)
+            .content("User joined the project")
+            .senderName(getUserName(userId))
+            .createdAt(LocalDateTime.now())
+            .build();
+        
+        broadcastToProject(projectId, joinMessage, session);
+    }
+    
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+        try {
+            String projectId = extractProjectId(session);
+            Long userId = sessionUserMap.get(session.getId());
+            
+            ChatMessageRequest request = objectMapper.readValue(message.getPayload(), ChatMessageRequest.class);
+            
+            // Process and save message
+            ChatMessageDto chatMessage = chatService.saveMessage(projectId, userId, request);
+            
+            // Broadcast to all project members
+            broadcastToProject(projectId, chatMessage, null);
+            
+            // Handle mentions and notifications
+            handleMentionsAndNotifications(chatMessage);
+            
+        } catch (Exception e) {
+            log.error("Error processing WebSocket message", e);
+            sendErrorMessage(session, "Failed to process message");
+        }
+    }
+    
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+        String projectId = extractProjectId(session);
+        Long userId = sessionUserMap.remove(session.getId());
+        
+        log.info("WebSocket connection closed: projectId={}, userId={}", projectId, userId);
+        
+        // Remove session from project room
+        Set<WebSocketSession> sessions = projectSessions.get(projectId);
+        if (sessions != null) {
+            sessions.remove(session);
+            if (sessions.isEmpty()) {
+                projectSessions.remove(projectId);
+            }
+        }
+        
+        // Send user left notification
+        if (userId != null) {
+            ChatMessageDto leaveMessage = ChatMessageDto.builder()
+                .type(MessageType.USER_LEFT)
+                .content("User left the project")
+                .senderName(getUserName(userId))
+                .createdAt(LocalDateTime.now())
+                .build();
+            
+            broadcastToProject(projectId, leaveMessage, null);
+        }
+    }
+    
+    private void broadcastToProject(String projectId, ChatMessageDto message, WebSocketSession excludeSession) {
+        Set<WebSocketSession> sessions = projectSessions.get(projectId);
+        if (sessions == null) return;
+        
+        String messageJson;
+        try {
+            messageJson = objectMapper.writeValueAsString(message);
+        } catch (Exception e) {
+            log.error("Failed to serialize message", e);
+            return;
+        }
+        
+        sessions.removeIf(session -> {
+            try {
+                if (session.equals(excludeSession)) return false;
+                
+                if (session.isOpen()) {
+                    session.sendMessage(new TextMessage(messageJson));
+                    return false;
+                } else {
+                    return true; // Remove closed sessions
+                }
+            } catch (Exception e) {
+                log.error("Failed to send message to session", e);
+                return true; // Remove problematic sessions
+            }
+        });
+    }
+    
+    private void handleMentionsAndNotifications(ChatMessageDto message) {
+        // Process user mentions (@username)
+        if (message.getMentionedUsers() != null && !message.getMentionedUsers().isEmpty()) {
+            // Send notifications to mentioned users
+            // Implementation depends on notification system
+        }
+        
+        // Process task mentions (#task-123)
+        if (message.getMentionedTask() != null) {
+            // Add comment to task or create activity
+        }
+    }
+    
+    private String extractProjectId(WebSocketSession session) {
+        String uri = session.getUri().toString();
+        return uri.substring(uri.lastIndexOf("/") + 1);
+    }
+    
+    private Long extractUserId(WebSocketSession session) {
+        // Extract from session attributes or JWT token
+        return (Long) session.getAttributes().get("userId");
+    }
